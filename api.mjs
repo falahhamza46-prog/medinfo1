@@ -61,7 +61,7 @@ async function sendPush(title, body, extra = {}) {
   webpush.setVapidDetails('mailto:' + (process.env.CONTACT_EMAIL || 'admin@example.com'), v.publicKey, v.privateKey);
   const P = store('push');
   const { blobs } = await P.list();
-  const tab = ['schedule', 'subjects', 'hw', 'notices'].includes(extra.tab) ? extra.tab : '';
+  const tab = ['schedule', 'subjects', 'hw', 'notices', 'photos'].includes(extra.tab) ? extra.tab : '';
   const course = ['c1', 'c2'].includes(extra.course) ? extra.course : '';
   const payload = JSON.stringify({ title, body: body || '', tab, course });
   await Promise.allSettled(
@@ -78,6 +78,30 @@ const bump = async () => { const v = String(Date.now()); await store('data').set
 const fileIndex = async () => (await store('data').get('files', { type: 'json' })) || [];
 const ID = /^[a-f0-9-]{36}$/;
 
+/* ---------- الصور المشتركة ---------- */
+const photoIndex = async () => (await store('data').get('photos', { type: 'json' })) || [];
+const sha256 = (x) => createHash('sha256').update(String(x)).digest('hex');
+const publicPhoto = ({ k, ...p }) => p; // لا نكشف هاش السر
+const isJpeg = (u8) => u8.length > 4 && u8[0] === 0xff && u8[1] === 0xd8 && u8[2] === 0xff;
+const MAX_FULL = 1.6 * 1024 * 1024;
+const MAX_THUMB = 160 * 1024;
+const MAX_PER_STUDENT = 60;
+const MAX_TOTAL = 800;
+// تعديل الفهرس مع التحقق بعد الكتابة لتقليل ضياع التحديثات عند الرفع المتزامن
+async function mutatePhotos(fn, verify) {
+  for (let i = 0; i < 4; i++) {
+    const idx = fn(await photoIndex());
+    await store('data').setJSON('photos', idx);
+    const after = await photoIndex();
+    if (verify(after)) return after;
+    await new Promise((r) => setTimeout(r, 120 + Math.random() * 280));
+  }
+  return photoIndex();
+}
+
+// الحالة العامة: بدون أسرار الطلبة (يُرسل فقط هل الاسم محجوز)
+const pubState = (st) => st && Object.assign({}, st, { students: ((st && st.students) || []).map((x) => ({ id: x.id, name: x.name, claimed: !!x.claimed })) });
+
 /* ---------- المسارات ---------- */
 export default async (req) => {
   const url = new URL(req.url);
@@ -91,7 +115,7 @@ export default async (req) => {
       const ver = (await D.get('ver')) || '0';
       if (url.searchParams.get('ver') === ver) return json({ unchanged: true, vapid });
       const state = await D.get('state', { type: 'json' });
-      return json({ state, files: await fileIndex(), ver, vapid });
+      return json({ state: pubState(state), files: await fileIndex(), photos: (await photoIndex()).map(publicPhoto), ver, vapid });
     }
 
     if (path === '/login' && method === 'POST') {
@@ -99,6 +123,24 @@ export default async (req) => {
       const r = await checkPassword(pw || '');
       if (!r.ok) { await new Promise((res) => setTimeout(res, 700)); return fail('كلمة المرور غير صحيحة', 403); }
       return json({ ...(await makeToken()), defaultPw: r.isDefault });
+    }
+
+    // اختيار الاسم: كل اسم يُحجز لشخص واحد فقط ويختفي من القائمة عند الباقين
+    if (path === '/claim' && method === 'POST') {
+      const { id } = await req.json();
+      const D = store('data');
+      const st = await D.get('state', { type: 'json' });
+      const stu = ((st && st.students) || []).find((x) => x.id === String(id));
+      if (!stu) return fail('الاسم غير موجود في القائمة', 404);
+      if (stu.claimed) return fail('هذا الاسم اختاره شخص آخر. اختر اسماً آخر', 409);
+      const ck = randomBytes(16).toString('hex');
+      stu.claimed = true; stu.k = sha256(ck);
+      await D.set('state', JSON.stringify(st));
+      await new Promise((r) => setTimeout(r, 150));
+      const chk = await D.get('state', { type: 'json' });
+      const again = ((chk && chk.students) || []).find((x) => x.id === stu.id);
+      if (!again || again.k !== stu.k) return fail('هذا الاسم اختاره شخص آخر. اختر اسماً آخر', 409);
+      return json({ ck, ver: await bump() });
     }
 
     if (path === '/push' && method === 'POST') {
@@ -133,6 +175,74 @@ export default async (req) => {
       });
     }
 
+    if (path.startsWith('/photos/') && method === 'GET') {
+      const id = path.slice(8);
+      if (!ID.test(id)) return fail('غير موجود', 404);
+      const key = url.searchParams.get('t') === '1' ? id + '.t' : id;
+      const r = await store('photos').get(key, { type: 'arrayBuffer' });
+      if (!r) return fail('غير موجود', 404);
+      return new Response(r, {
+        headers: {
+          'content-type': 'image/jpeg',
+          'content-disposition': 'inline; filename="photo-' + id.slice(0, 8) + '.jpg"',
+          'cache-control': 'public, max-age=31536000, immutable',
+          'x-content-type-options': 'nosniff',
+        },
+      });
+    }
+
+    if (path === '/photos' && method === 'POST') {
+      let meta;
+      try { meta = JSON.parse(decodeURIComponent(req.headers.get('x-meta') || '')); } catch { return fail('بيانات الصورة ناقصة'); }
+      const sid = String(meta.sid || '');
+      let name;
+      if (sid === 'admin') {
+        if (!(await isAdmin(req))) return fail('يلزم تسجيل الدخول كأدمن', 401);
+        name = 'الأدمن';
+      } else {
+        const st = await store('data').get('state', { type: 'json' });
+        const stu = ((st && st.students) || []).find((x) => x.id === sid);
+        if (!stu || !stu.claimed || !same(sha256(req.headers.get('x-ck') || ''), String(stu.k || ''))) return fail('اسمك غير مفعّل. أعد اختيار اسمك', 403);
+        name = String(stu.name).slice(0, 80);
+      }
+      const buf = new Uint8Array(await req.arrayBuffer());
+      if (buf.length < 12 || buf.length > MAX_FULL + MAX_THUMB + 8) return fail('حجم الصورة غير مقبول');
+      const tl = ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0;
+      if (tl < 100 || tl > MAX_THUMB || 4 + tl >= buf.length) return fail('بيانات الصورة غير صالحة');
+      const thumb = buf.slice(4, 4 + tl);
+      const full = buf.slice(4 + tl);
+      if (full.length > MAX_FULL) return fail('الصورة كبيرة جداً');
+      if (!isJpeg(thumb) || !isJpeg(full)) return fail('الصور المقبولة بصيغة JPEG فقط');
+      const idx0 = await photoIndex();
+      if (idx0.length >= MAX_TOTAL) return fail('امتلأ الألبوم. تواصل مع الأدمن');
+      if (sid !== 'admin' && idx0.filter((p) => p.sid === sid).length >= MAX_PER_STUDENT) return fail('وصلت إلى الحد الأقصى من الصور (' + MAX_PER_STUDENT + ')');
+      const id = randomUUID();
+      const secret = randomBytes(16).toString('hex');
+      await store('photos').set(id, full.buffer.slice(full.byteOffset, full.byteOffset + full.byteLength));
+      await store('photos').set(id + '.t', thumb.buffer.slice(thumb.byteOffset, thumb.byteOffset + thumb.byteLength));
+      const w = Math.max(0, Math.min(10000, Number(meta.w) || 0));
+      const h = Math.max(0, Math.min(10000, Number(meta.h) || 0));
+      const photo = { id, sid, name, cap: String(meta.cap || '').slice(0, 140), at: Date.now(), w, h, k: sha256(secret) };
+      await mutatePhotos((a) => a.concat(photo), (a) => a.some((p) => p.id === id));
+      const ver = await bump();
+      if (sid === 'admin') await sendPush('صورة جديدة', 'شاركها ' + name, { tab: 'photos' });
+      return json({ photo: publicPhoto(photo), secret, ver });
+    }
+
+    if (path.startsWith('/photos/') && method === 'DELETE') {
+      const id = path.slice(8);
+      if (!ID.test(id)) return fail('غير موجود', 404);
+      const p = (await photoIndex()).find((x) => x.id === id);
+      if (!p) return fail('غير موجود', 404);
+      const secret = req.headers.get('x-secret') || '';
+      const mine = secret && same(sha256(secret), p.k);
+      if (!mine && !(await isAdmin(req))) return fail('لا تملك صلاحية حذف هذه الصورة', 403);
+      await store('photos').delete(id);
+      await store('photos').delete(id + '.t');
+      await mutatePhotos((a) => a.filter((x) => x.id !== id), (a) => !a.some((x) => x.id === id));
+      return json({ ver: await bump() });
+    }
+
     // كل ما بعد هذا يحتاج أدمن
     if (!(await isAdmin(req))) return fail('يلزم تسجيل الدخول كأدمن', 401);
 
@@ -140,12 +250,30 @@ export default async (req) => {
       const { state, notify } = await req.json();
       if (!state || typeof state !== 'object') return fail('بيانات غير صالحة');
       delete state.pw;
+      // الحفاظ على حجز الأسماء: العميل لا يرى الأسرار فندمجها من المخزّن
+      const old = await store('data').get('state', { type: 'json' });
+      const om = new Map(((old && old.students) || []).map((x) => [x.id, x]));
+      state.students = (Array.isArray(state.students) ? state.students : ((old && old.students) || [])).slice(0, 500).map((x) => {
+        const o = om.get(x.id);
+        return { id: String(x.id).slice(0, 40), name: String(x.name).slice(0, 80), ...(o && o.claimed ? { claimed: true, k: o.k } : {}) };
+      });
       const raw = JSON.stringify(state);
       if (raw.length > 1_500_000) return fail('حجم البيانات كبير جداً');
       await store('data').set('state', raw);
       const ver = await bump();
       if (notify && notify.title) await sendPush(String(notify.title).slice(0, 80), String(notify.body || '').slice(0, 140), notify);
       return json({ ver });
+    }
+
+    if (path === '/unclaim' && method === 'POST') {
+      const { id } = await req.json();
+      const D = store('data');
+      const st = await D.get('state', { type: 'json' });
+      const stu = ((st && st.students) || []).find((x) => x.id === String(id));
+      if (!stu) return fail('غير موجود', 404);
+      delete stu.claimed; delete stu.k;
+      await D.set('state', JSON.stringify(st));
+      return json({ ver: await bump() });
     }
 
     if (path === '/password' && method === 'POST') {

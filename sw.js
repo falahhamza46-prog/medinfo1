@@ -1,6 +1,8 @@
-const CACHE = 'medinfo-v2';
+const CACHE = 'medinfo-v3';
 const FILES = 'medinfo-files'; // نفس اسم الذاكرة الذي تستخدمه الصفحة
 const FONTS = 'medinfo-fonts-v1';
+const PHOTOS = 'medinfo-photos-v1';
+const PHOTO_LIMIT = 220;
 const SHELL = ['/', '/icon.svg', '/icon-192.png', '/icon-512.png', '/manifest.json'];
 
 self.addEventListener('install', (e) => {
@@ -9,7 +11,7 @@ self.addEventListener('install', (e) => {
 self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys()
-      .then((k) => Promise.all(k.filter((x) => ![CACHE, FILES, FONTS].includes(x)).map((x) => caches.delete(x))))
+      .then((k) => Promise.all(k.filter((x) => ![CACHE, FILES, FONTS, PHOTOS].includes(x)).map((x) => caches.delete(x))))
       .then(() => self.clients.claim())
   );
 });
@@ -47,7 +49,36 @@ self.addEventListener('fetch', (e) => {
     })());
     return;
   }
+  // صور الألبوم: تُحفظ عند أول مشاهدة لتظهر بدون إنترنت (حد أقصى للعدد)
+  if (u.pathname.startsWith('/api/photos/')) {
+    e.respondWith((async () => {
+      const c = await caches.open(PHOTOS);
+      const hit = await c.match(req);
+      if (hit) return hit;
+      const r = await fetch(req);
+      if (r.ok) {
+        await c.put(req, r.clone()).catch(() => {});
+        const keys = await c.keys();
+        for (let i = 0; i < keys.length - PHOTO_LIMIT; i++) await c.delete(keys[i]);
+      }
+      return r;
+    })());
+    return;
+  }
   if (u.pathname.startsWith('/api/')) return;
+
+  // مكتبات عارض الملفات (ثابتة): من الذاكرة أولاً
+  if (u.pathname.startsWith('/vendor/')) {
+    e.respondWith((async () => {
+      const c = await caches.open(CACHE);
+      const hit = await c.match(req);
+      if (hit) return hit;
+      const r = await fetch(req);
+      if (r.ok) c.put(req, r.clone()).catch(() => {});
+      return r;
+    })());
+    return;
+  }
 
   // الصفحة نفسها: الشبكة أولاً بمهلة قصيرة، ثم النسخة المخزنة
   e.respondWith(
