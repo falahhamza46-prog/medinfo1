@@ -1,4 +1,5 @@
 [build]
+  command = "mkdir -p public/vendor netlify/functions && cp index.html sw.js manifest.json icon.svg icon-192.png icon-512.png public/ && cp pdf.min.js pdf.worker.min.js mammoth.browser.min.js xlsx.full.min.js public/vendor/ && cp api.mjs netlify/functions/api.mjs"
   publish = "public"
 
 [build.environment]

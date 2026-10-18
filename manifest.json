@@ -1,0 +1,15 @@
+{
+  "name": "فرع المعلوماتية الطبية",
+  "short_name": "المعلوماتية الطبية",
+  "description": "جدول المحاضرات والملفات والواجبات - المرحلة الرابعة",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d2b36",
+  "theme_color": "#0d2b36",
+  "icons": [
+    {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}
